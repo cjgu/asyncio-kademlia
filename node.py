@@ -106,16 +106,81 @@ class KademliaClient(asyncio.DatagramProtocol):
         print("Connection made")
         self.transport = transport
         print("Sending message: {}".format(self.message))
-        self.transport.sendto(self.message.encode())
+        self.transport.sendto(self.message)
 
     def send(self, message, callback):
         self.message = message
         self.callback = callback
 
     def datagram_received(self, data, addr):
-        print('Data received: {}'.format(data.decode()))
+        print('Data received: {}'.format(data))
         loop = asyncio.get_event_loop()
         loop.call_soon(self.callback, data)
+
+
+class RpcRequest(object):
+
+    def __init__(self, method, params, source_node_id, request_id=None):
+        self.method = method
+        self.params = params
+        self.request_id = generate_request_id() if request_id is None else request_id
+        self.source_node_id = source_node_id
+
+    def serialize(self):
+        return json.dumps({
+            "method": self.method,
+            "request_id": self.request_id,
+            "params": self.params,
+            "node_id": int_to_hex(self.source_node_id)
+        }).encode()
+
+    @classmethod
+    def deserialize(cls, data):
+        data = json.loads(data.decode())
+
+        return RpcRequest(
+            data.get("method"),
+            data.get("params"),
+            hex_to_int(data.get("node_id")),
+            data.get("request_id"))
+
+    def __repr__(self):
+        return "RpcRequest <{},{},{},{}>".format(
+            self.method,
+            self.params,
+            self.request_id,
+            self.source_node_id)
+
+
+class RpcResponse(object):
+
+    def __init__(self, result, error, request_id, node_id):
+        self.result = result
+        self.error = error
+        self.request_id = request_id
+        self.node_id = node_id
+
+    def serialize(self):
+        return json.dumps({
+            "request_id": self.request_id,
+            "result": self.result,
+            "node_id": int_to_hex(self.node_id),
+            "error": self.error
+        }).encode()
+
+    @classmethod
+    def deserialize(cls, data):
+        data = json.loads(data.decode())
+
+        return RpcResponse(
+            data.get("result"),
+            data.get("error"),
+            data.get("request_id"),
+            hex_to_int(data.get('node_id')))
+
+    def __repr__(self):
+        return "RpcResponse <{},{},{},{}>".format(
+            self.result, self.error, self.request_id, self.node_id)
 
 
 class RpcClient(object):
@@ -134,19 +199,17 @@ class RpcClient(object):
 
     @asyncio.coroutine
     def ping(self, params, callback):
-        # Generate request ID
-        self.request_id = generate_request_id()
+        self.callback = callback
 
-        message = json.dumps({
-            "method": "ping",
-            "request_id": self.request_id,
-            "params": params,
-            "node_id": self.source_node_id
-        })
+        self.request = RpcRequest('ping', params, self.source_node_id)
 
-        self.client.send(message, callback)
+        self.client.send(self.request.serialize(), self.check_response)
 
         yield from self._connect()
+
+    def check_response(self, response):
+        response = RpcResponse.deserialize(response)
+        self.callback(response)
 
 
 class RpcClientFactory(object):
@@ -169,26 +232,23 @@ class KademliaNode(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self.transport = transport
 
-    def _is_valid_message(self, message):
-        if message is None or \
-           'request_id' not in message or\
-           'method' not in message or\
-           'params' not in message:
+    def _is_valid_request(self, request):
+        if request is None or \
+           request.request_id is None or\
+           request.method is None or\
+           request.params is None:
             return False
         return True
 
     def datagram_received(self, data, addr):
         print("Received from {}:{}".format(addr[0], addr[1]))
-        message = self._decode_message(data)
+        request = RpcRequest.deserialize(data)
 
-        if not self._is_valid_message(message):
+        if not self._is_valid_request(request):
+            # TODO extract function
             print("Invalid message")
-            resp = {
-                'request_id': message.get('request_id') if message else None,
-                'result': None,
-                'error': "Invalid request"
-            }
-            self.transport.sendto(self._encode_message(resp), addr=addr)
+            response = RpcResponse(None, "Invalid request", request.request_id, self.node_id)
+            self.transport.sendto(response.serialize(), addr=addr)
             return
 
         dispatch = {
@@ -197,28 +257,20 @@ class KademliaNode(asyncio.DatagramProtocol):
             'find_node': self.find_node,
             'find_value': self.find_value,
         }
-        func = dispatch.get(message.get('method'))
+        func = dispatch.get(request.method)
 
         if func is not None:
             result = error = None
             try:
-                result = func(message.get('params'), message.get('node_id'), addr)
+                result = func(request.params, request.source_node_id, addr)
             except Exception as e:
                 print(e)
                 error = "Internal server error"
-            resp = {
-                'request_id': message.get('request_id'),
-                'result': result,
-                'error': error
-            }
-            self.transport.sendto(self._encode_message(resp), addr=addr)
+            response = RpcResponse(result, error, request.request_id, self.node_id)
+            self.transport.sendto(response.serialize(), addr=addr)
         else:
-            resp = {
-                'request_id': message.get('request_id') if message else None,
-                'result': None,
-                'error': "Invalid method"
-            }
-            self.transport.sendto(self._encode_message(resp), addr=addr)
+            response = RpcResponse(None, "Invalid method", request.request_id, self.node_id)
+            self.transport.sendto(response.serialize(), addr=addr)
 
     def ping(self, message, node_id, addr):
         """ Ping command """
@@ -247,41 +299,18 @@ class KademliaNode(asyncio.DatagramProtocol):
     def error_received(self, exc):
         print(exc)
 
-    def _decode_message(self, message_bytes):
-        decoded = message_bytes.decode()
-
-        message = None
-        try:
-            message = json.loads(decoded)
-            message['node_id'] = self._decode_node_id(message['node_id'])
-            return message
-        except Exception as e:
-            print(str(e))
-            return
-
-    def _encode_message(self, message):
-        message['node_id'] = self._encode_node_id(self.node_id)
-
-        return json.dumps(message).encode()
-
-    def _decode_node_id(self, node_id_bytes):
-        return hex_to_int(node_id_bytes)
-
-    def _encode_node_id(self, node_id):
-        return int_to_hex(node_id)
-
     @asyncio.coroutine
     def connect_to_node(self, addr):
         remote_addr, remote_port = addr
         print("Attempt to connect to {}:{}".format(remote_addr, remote_port))
-        client = self.client_factory.client(self._encode_node_id(self.node_id), addr)
+        client = self.client_factory.client(self.node_id, addr)
 
         print("Pinging node")
         yield from client.ping([], self.ping_response)
 
-    def ping_response(self, data):
-        message = self._decode_message(data)
-        print("PING RESPONSE", message)
+    def ping_response(self, response):
+        # TODO: Update routing table
+        print("PING RESPONSE", response)
 
 
 def generate_node_id():
@@ -303,8 +332,18 @@ def bytes_to_hex(bytes):
     return binascii.hexlify(bytes).decode('utf-8')
 
 
+def hex_to_bytes(hex_str):
+    return binascii.unhexlify(hex_str)
+
+
 def hex_to_int(hex_str):
-    bytes = binascii.unhexlify(hex_str)
+    if not hex_str:
+        return None
+    bytes = hex_to_bytes(hex_str)
+    return bytes_to_int(bytes)
+
+
+def bytes_to_int(bytes):
     return int.from_bytes(bytes, byteorder='big')
 
 
