@@ -209,6 +209,7 @@ class RpcClient(object):
 
     def check_response(self, response):
         response = RpcResponse.deserialize(response)
+        response.address = (self.addr, self.port)
         self.callback(response)
 
 
@@ -266,10 +267,12 @@ class KademliaNode(asyncio.DatagramProtocol):
             except Exception as e:
                 print(e)
                 error = "Internal server error"
-            response = RpcResponse(result, error, request.request_id, self.node_id)
+            response = RpcResponse(
+                result, error, request.request_id, self.node_id)
             self.transport.sendto(response.serialize(), addr=addr)
         else:
-            response = RpcResponse(None, "Invalid method", request.request_id, self.node_id)
+            response = RpcResponse(
+                None, "Invalid method", request.request_id, self.node_id)
             self.transport.sendto(response.serialize(), addr=addr)
 
     def ping(self, message, node_id, addr):
@@ -311,6 +314,9 @@ class KademliaNode(asyncio.DatagramProtocol):
     def ping_response(self, response):
         # TODO: Update routing table
         print("PING RESPONSE", response)
+        contact = Contact(response.node_id, response.address)
+        self.routes.add_seen_contact(contact)
+        print(self.routes.table)
 
 
 def generate_node_id():
