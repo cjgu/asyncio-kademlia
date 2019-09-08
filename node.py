@@ -1,23 +1,27 @@
 """DHT Node
 
 Usage:
-  node.py <listen-port> [--remote=<remote-node-ip>] [--remote-port=<remote-port>] [--node-id=<node-id>]
+  node.py <listen-port> [--remote=<remote-node-address>] [--node-id=<node-id>]
   node.py (-h | --help)
   node.py --version
 
 Options:
   --node-id=<node-id>
-  --remote=<remote-node-ip>    The remote IP of a node in system
-  --remote-port=<remote port>  The port of the remote node
+  --remote=<remote-node-address>    The remote host:port of a node in system
 """
 
+import logging
 import asyncio
 from docopt import docopt
-import hashlib
-import binascii
-import os
 import json
 from datetime import datetime
+
+from utils import (
+    bytes_to_hex,
+    int_to_hex,
+    hex_to_int,
+    generate_byte_string
+)
 
 networkParallelism = 3
 maxContactsPerBucket = 20
@@ -57,8 +61,8 @@ class RoutingTable(object):
 
     def add_seen_contact(self, contact):
         dist = self.distance(contact)
-        print("Distance to seen node: {}".format(dist))
-        print("Bucket for node: {}".format(self.bucket_number(dist)))
+        logging.info("Distance to seen node: {}".format(dist))
+        logging.info("Bucket for node: {}".format(self.bucket_number(dist)))
 
         bucket = self.get_bucket(self.bucket_number(dist))
 
@@ -103,9 +107,9 @@ class KademliaClient(asyncio.DatagramProtocol):
         self.transport = None
 
     def connection_made(self, transport):
-        print("Connection made")
+        logging.info("Connection made")
         self.transport = transport
-        print("Sending message: {}".format(self.message))
+        logging.info("Sending message: {}".format(self.message))
         self.transport.sendto(self.message)
 
     def send(self, message, callback):
@@ -113,7 +117,7 @@ class KademliaClient(asyncio.DatagramProtocol):
         self.callback = callback
 
     def datagram_received(self, data, addr):
-        print('Data received: {}'.format(data))
+        logging.info('Data received: {}'.format(data))
         loop = asyncio.get_event_loop()
         loop.call_soon(self.callback, data)
 
@@ -216,7 +220,8 @@ class RpcClient(object):
 class RpcClientFactory(object):
     @classmethod
     def client(self, source_node_id, address):
-        addr, port = address
+        addr, port = address.split(':')
+        port = int(port)
         client = RpcClient(source_node_id, addr, port)
         return client
 
@@ -242,12 +247,12 @@ class KademliaNode(asyncio.DatagramProtocol):
         return True
 
     def datagram_received(self, data, addr):
-        print("Received from {}:{}".format(addr[0], addr[1]))
+        logging.info("Received from {}:{}".format(addr[0], addr[1]))
         request = RpcRequest.deserialize(data)
 
         if not self._is_valid_request(request):
             # TODO extract function
-            print("Invalid message")
+            logging.info("Invalid message")
             response = RpcResponse(None, "Invalid request", request.request_id, self.node_id)
             self.transport.sendto(response.serialize(), addr=addr)
             return
@@ -265,7 +270,7 @@ class KademliaNode(asyncio.DatagramProtocol):
             try:
                 result = func(request.params, request.source_node_id, addr)
             except Exception as e:
-                print(e)
+                logging.error(e)
                 error = "Internal server error"
             response = RpcResponse(
                 result, error, request.request_id, self.node_id)
@@ -277,14 +282,14 @@ class KademliaNode(asyncio.DatagramProtocol):
 
     def ping(self, message, node_id, addr):
         """ Ping command """
-        print("Received PING from node {}".format(node_id))
+        logging.info("Received PING from node {}".format(node_id))
 
         contact = Contact(node_id, addr)
         self.routes.add_seen_contact(contact)
 
         # TODO: Return known hosts
 
-        print(self.routes.table)
+        logging.info("Routes: {}".format(self.routes.table))
         return {}
 
     def store(self, message, node_id, addr):
@@ -300,23 +305,23 @@ class KademliaNode(asyncio.DatagramProtocol):
         return {}
 
     def error_received(self, exc):
-        print(exc)
+        logging.error(exc)
 
     @asyncio.coroutine
     def connect_to_node(self, addr):
-        remote_addr, remote_port = addr
-        print("Attempt to connect to {}:{}".format(remote_addr, remote_port))
+        logging.info("Attempt to connect to {}".format(addr))
+
         client = self.client_factory.client(self.node_id, addr)
 
-        print("Pinging node")
+        logging.info("Pinging node")
         yield from client.ping([], self.ping_response)
 
     def ping_response(self, response):
         # TODO: Update routing table
-        print("PING RESPONSE", response)
+        logging.info("PING RESPONSE: %s", response)
         contact = Contact(response.node_id, response.address)
         self.routes.add_seen_contact(contact)
-        print(self.routes.table)
+        logging.info(self.routes.table)
 
 
 def generate_node_id():
@@ -329,62 +334,35 @@ def generate_request_id():
     return bytes_to_hex(generate_byte_string(160))
 
 
-def int_to_hex(n):
-    bytes = (n).to_bytes(160//8, byteorder='big')
-    return bytes_to_hex(bytes)
-
-
-def bytes_to_hex(bytes):
-    return binascii.hexlify(bytes).decode('utf-8')
-
-
-def hex_to_bytes(hex_str):
-    return binascii.unhexlify(hex_str)
-
-
-def hex_to_int(hex_str):
-    if not hex_str:
-        return None
-    bytes = hex_to_bytes(hex_str)
-    return bytes_to_int(bytes)
-
-
-def bytes_to_int(bytes):
-    return int.from_bytes(bytes, byteorder='big')
-
-
-def generate_byte_string(bit_size):
-    return os.urandom(bit_size//8)
-
-
 def main():
     arguments = docopt(__doc__, version='DHT Node 0.1')
+    logging.basicConfig(level=logging.DEBUG)
 
     port = arguments['<listen-port>']
     remote_addr = arguments['--remote']
-    remote_port = arguments['--remote-port']
     node_id = arguments['--node-id']
 
     if not node_id:
         node_id = generate_node_id()
 
-    print("Port: {}".format(port))
-    print("Remote address {}:{}".format(remote_addr, remote_port))
-    print("Node id {0}".format(node_id))
+    logging.info("Port: {}".format(port))
+    logging.info("Remote address {}".format(remote_addr))
+    logging.info("Node id {0}".format(node_id))
 
     node = KademliaNode(node_id)
 
     loop = asyncio.get_event_loop()
+    loop.set_debug(enabled=True)
     coro = loop.create_datagram_endpoint(lambda: node, local_addr=('127.0.0.1', port))
     server, _ = loop.run_until_complete(coro)
 
-    if remote_addr and remote_port:
-        loop.run_until_complete(node.connect_to_node((remote_addr, remote_port)))
+    if remote_addr:
+        loop.run_until_complete(node.connect_to_node(remote_addr))
 
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        print("Shutting down")
+        logging.info("Shutting down")
     finally:
         server.close()
         loop.close()
